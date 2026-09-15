@@ -1,0 +1,262 @@
+import socket
+import selectors
+import time
+import json
+import base64
+from datetime import datetime
+
+# Importación de la librería de criptografía para Autenticación Asimétrica
+try:
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.exceptions import InvalidSignature
+except ImportError:
+    print("[ERROR] Debe instalar la librería 'cryptography'. Ejecute: pip install cryptography")
+    exit(1)
+
+# ----------------------------------------------------------------------
+# CONFIGURACIÓN GENERAL DEL SERVIDOR
+# ----------------------------------------------------------------------
+HOST = '0.0.0.0'  # Escuchar en todas las interfaces de red disponibles
+PORT = 65432  # Puerto UDP del servicio
+BUFFER_SIZE = 4096
+LOG_FILE = "chat_log.txt"
+
+# Configuración del Rate Limiter (Control de Tasa)
+MAX_MESSAGES_PER_WINDOW = 3  # Máximo de mensajes permitidos
+TIME_WINDOW_SECONDS = 1.0  # Ventana de tiempo en segundos
+
+# ----------------------------------------------------------------------
+# ESTRUCTURAS DE DATOS Y SELECTOR
+# ----------------------------------------------------------------------
+sel = selectors.DefaultSelector()
+
+# Registro de clientes autenticados:
+# Key: (ip, puerto) -> Value: {"username": str, "public_key": RSA_Key_Object}
+clients = {}
+
+# Historial de marcas de tiempo para Rate Limiting:
+# Key: (ip, puerto) -> Value: Lista de timestamps [float, float, ...]
+client_timestamps = {}
+
+
+# ----------------------------------------------------------------------
+# FUNCIONES AUXILIARES
+# ----------------------------------------------------------------------
+def check_rate_limit(addr: tuple) -> bool:
+    """
+    Control de Tasa (Rate Limiting):
+    Calcula cuántos mensajes ha enviado el cliente en la ventana de tiempo.
+    Retorna True si el cliente HA SIDO LIMITADO (se superó la tasa máxima).
+    """
+    now = time.time()
+    timestamps = client_timestamps.get(addr, [])
+
+    # Filtrar marcas de tiempo conservando solo las ocurridas en la ventana definida
+    timestamps = [t for t in timestamps if now - t < TIME_WINDOW_SECONDS]
+
+    if len(timestamps) >= MAX_MESSAGES_PER_WINDOW:
+        client_timestamps[addr] = timestamps
+        return True  # Límite excedido
+
+    # Registrar la solicitud actual y actualizar
+    timestamps.append(now)
+    client_timestamps[addr] = timestamps
+    return False
+
+
+def verify_signature(public_key, content_str: str, signature_b64: str) -> bool:
+    """
+    Autenticación Asimétrica:
+    Verifica que la firma digital en Base64 coincida con el mensaje y la clave pública del cliente.
+    """
+    try:
+        signature_bytes = base64.b64decode(signature_b64)
+        public_key.verify(
+            signature_bytes,
+            content_str.encode('utf-8'),
+            padding.PKCS1v15(),
+            hashes.SHA256()
+        )
+        return True
+    except InvalidSignature:
+        return False
+    except Exception as e:
+        print(f"[ERROR CRIPTOGRÁFICO] Excepción al verificar firma: {e}")
+        return False
+
+
+def save_to_log(timestamp_str: str, username: str, addr: tuple, message: str):
+    """
+    Persistencia: Escribe el registro en el archivo de texto .txt.
+    """
+    log_entry = f"[{timestamp_str}] [{username} @ {addr[0]}:{addr[1]}] -> {message}\n"
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(log_entry)
+    except IOError as e:
+        print(f"[ERROR PERSISTENCIA] Error al escribir en el archivo {LOG_FILE}: {e}")
+
+
+def broadcast_message(sock: socket.socket, sender_addr: tuple, sender_name: str, content: str, timestamp_str: str):
+    """
+    Retransmisión UDP (Relay):
+    Reenvía el mensaje a todos los clientes registrados excepto al emisor.
+    """
+    payload = {
+        "type": "broadcast",
+        "sender": sender_name,
+        "content": content,
+        "timestamp": timestamp_str
+    }
+    data_to_send = json.dumps(payload).encode('utf-8')
+
+    for client_addr in list(clients.keys()):
+        if client_addr != sender_addr:
+            try:
+                sock.sendto(data_to_send, client_addr)
+            except Exception as e:
+                print(f"[ERROR RELAY] No se pudo retransmitir a {client_addr}: {e}")
+
+
+# ----------------------------------------------------------------------
+# CALLBACK MANEJADOR DE EVENTOS DE LECTURA (SELECTORS)
+# ----------------------------------------------------------------------
+def handle_udp_read(sock: socket.socket, mask):
+    """
+    Esta función se invoca automáticamente cuando hay un datagrama UDP listo en el socket.
+    """
+    try:
+        data, addr = sock.recvfrom(BUFFER_SIZE)
+    except Exception as e:
+        print(f"[ERROR RED] Error al recibir datagrama: {e}")
+        return
+
+    if not data:
+        return
+
+    # 1. EVALUAR LIMITACIÓN DE TASA (RATE LIMITING)
+    if check_rate_limit(addr):
+        print(f"[ALERTA RATE LIMIT] {addr[0]}:{addr[1]} excedió la tasa permitida. Paquete descartado.")
+        error_payload = {
+            "type": "error",
+            "message": f"CONTROL DE TASA ACTIVADO: Máximo {MAX_MESSAGES_PER_WINDOW} msgs/seg. Paquete descartado."
+        }
+        sock.sendto(json.dumps(error_payload).encode('utf-8'), addr)
+        return
+
+    # 2. DECODIFICACIÓN DEL PAQUETE JSON
+    try:
+        packet = json.loads(data.decode('utf-8'))
+    except Exception:
+        print(f"[PAQUETE INVÁLIDO] Datagrama corrupto o formato no JSON desde {addr}.")
+        return
+
+    msg_type = packet.get("type")
+
+    # 3. REGISTRO Y AUTENTICACIÓN ASIMÉTRICA
+    if msg_type == "register":
+        username = packet.get("username", "Anonimo")
+        pem_key = packet.get("public_key_pem")
+
+        if not pem_key:
+            print(f"[REGISTRO FALLIDO] {addr} no incluyó la clave pública.")
+            return
+
+        try:
+            # Cargar y guardar la clave pública del usuario
+            pub_key = serialization.load_pem_public_key(pem_key.encode('utf-8'))
+            clients[addr] = {
+                "username": username,
+                "public_key": pub_key
+            }
+            print(f"[NUEVO REGISTRO] Usuario '{username}' autenticado desde {addr[0]}:{addr[1]}")
+
+            # Responder al cliente con confirmación
+            response = {
+                "type": "ack",
+                "status": "ok",
+                "message": f"Clave pública recibida. Usuario '{username}' autenticado."
+            }
+            sock.sendto(json.dumps(response).encode('utf-8'), addr)
+
+        except Exception as e:
+            print(f"[ERROR REGISTRO] Clave pública inválida desde {addr}: {e}")
+
+    elif msg_type == "message":
+        # Verificar que la dirección haya realizado el proceso de registro
+        if addr not in clients:
+            print(f"[RECHAZADO] Mensaje sin registro previo desde {addr}.")
+            err_msg = {"type": "error", "message": "Debe registrar su clave pública primero."}
+            sock.sendto(json.dumps(err_msg).encode('utf-8'), addr)
+            return
+
+        client_info = clients[addr]
+        username = client_info["username"]
+        pub_key = client_info["public_key"]
+
+        content = packet.get("content", "")
+        signature_b64 = packet.get("signature", "")
+
+        # Verificar Firma Digital Asimétrica
+        if not verify_signature(pub_key, content, signature_b64):
+            print(
+                f"[ALERTA DE SEGURIDAD] Firma digital INVÁLIDA recibida de '{username}' ({addr}). Mensaje descartado.")
+            err_msg = {"type": "error", "message": "Firma digital no válida. Autenticación fallida."}
+            sock.sendto(json.dumps(err_msg).encode('utf-8'), addr)
+            return
+
+        # 4. PERSISTENCIA EN ARCHIVO .TXT CON TIMESTAMP
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now_str}] [MENSAJE AUTÉNTICO] {username} ({addr[0]}:{addr[1]}): {content}")
+        save_to_log(now_str, username, addr, content)
+
+        # 5. RETRANSMISIÓN A LOS DEMÁS CLIENTES (RELAY)
+        broadcast_message(sock, addr, username, content, now_str)
+
+
+# ----------------------------------------------------------------------
+# PUNTO DE ENTRADA PRINCIPAL
+# ----------------------------------------------------------------------
+def main():
+    # Crear Socket UDP (SOCK_DGRAM)
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    # Enlazar Dirección e IP
+    server_socket.bind((HOST, PORT))
+
+    # IMPORTANTE: Establecer socket no bloqueante para trabajar con 'selectors'
+    server_socket.setblocking(False)
+
+    # Registrar el socket en el selector para supervisar eventos de lectura
+    sel.register(server_socket, selectors.EVENT_READ, data=handle_udp_read)
+
+    print("=" * 70)
+    print(" SERVIDOR CHAT UDP CON LIMITACIÓN DE TASA Y AUTENTICACIÓN (G8)")
+    print("=" * 70)
+    print(f" Direccionamiento: {HOST}:{PORT}")
+    print(f" Modelo Concurrencia: Event-Driven (`selectors`)")
+    print(f" Esquema Criptográfico: Autenticación Asimétrica (RSA + SHA-256)")
+    print(f" Límite de Tasa: {MAX_MESSAGES_PER_WINDOW} msgs / {TIME_WINDOW_SECONDS}s por cliente")
+    print(f" Persistencia: Guardando en '{LOG_FILE}'")
+    print("=" * 70)
+    print(" Esperando conexiones/datagramas de clientes...\n")
+
+    try:
+        # Bucle principal impulsado por eventos
+        while True:
+            events = sel.select(timeout=None)
+            for key, mask in events:
+                callback = key.data
+                callback(key.fileobj, mask)
+    except KeyboardInterrupt:
+        print("\n[APAGADO] Deteniendo servidor UDP...")
+    finally:
+        sel.unregister(server_socket)
+        server_socket.close()
+        sel.close()
+        print("[SERVIDOR DETENIDO] Recursos liberados correctamente.")
+
+
+if __name__ == "__main__":
+    main()
