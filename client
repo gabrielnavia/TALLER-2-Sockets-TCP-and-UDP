@@ -1,0 +1,147 @@
+import socket
+import threading
+import json
+import base64
+import sys
+from datetime import datetime
+
+try:
+    from cryptography.hazmat.primitives.asymmetric import rsa, padding
+    from cryptography.hazmat.primitives import hashes, serialization
+except ImportError:
+    print("[ERROR] Debe instalar la librería 'cryptography'. Ejecute: pip install cryptography")
+    sys.exit(1)
+
+# Configuración por defecto para conexión
+SERVER_HOST = '127.0.0.1'
+SERVER_PORT = 65432
+BUFFER_SIZE = 4096
+
+
+class UDPClient:
+    def __init__(self, host=SERVER_HOST, port=SERVER_PORT):
+        self.server_addr = (host, port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.username = ""
+        self.running = True
+
+        # Generar par de claves RSA (2048 bits) para autenticación asimétrica
+        print("[CRIPTO] Generando par de claves RSA para el cliente...")
+        self.private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048
+        )
+        self.public_key = self.private_key.public_key()
+
+    def get_public_key_pem(self) -> str:
+        """Exporta la clave pública del cliente en formato PEM."""
+        pem = self.public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        return pem.decode('utf-8')
+
+    def sign_message(self, message: str) -> str:
+        """Firma el mensaje usando la clave privada (PKCS1v15 + SHA256) y lo codifica en Base64."""
+        signature = self.private_key.sign(
+            message.encode('utf-8'),
+            padding.PKCS1v15(),
+            hashes.SHA256()
+        )
+        return base64.b64encode(signature).decode('utf-8')
+
+    def register(self):
+        """Registra al usuario enviando la clave pública en formato PEM al servidor."""
+        self.username = input("Ingrese su apodo/nickname: ").strip() or "Anonimo"
+        payload = {
+            "type": "register",
+            "username": self.username,
+            "public_key_pem": self.get_public_key_pem()
+        }
+        try:
+            self.sock.sendto(json.dumps(payload).encode('utf-8'), self.server_addr)
+        except Exception as e:
+            print(f"[ERROR REGISTRO] Fallo al enviar paquete de registro: {e}")
+
+    def receive_messages(self):
+        """Hilo secundario dedicado a la lectura contínua de datagramas UDP del servidor."""
+        while self.running:
+            try:
+                data, _ = self.sock.recvfrom(BUFFER_SIZE)
+                if not data:
+                    continue
+
+                packet = json.loads(data.decode('utf-8'))
+                msg_type = packet.get("type")
+
+                if msg_type == "broadcast":
+                    sender = packet.get("sender", "Desconocido")
+                    content = packet.get("content", "")
+                    raw_time = packet.get("timestamp", "")
+
+                    # Formatear la marca de tiempo a formato HH:MM según requerimiento del sistema
+                    try:
+                        time_obj = datetime.strptime(raw_time, "%Y-%m-%d %H:%M:%S")
+                        formatted_time = time_obj.strftime("%H:%M")
+                    except ValueError:
+                        formatted_time = datetime.now().strftime("%H:%M")
+
+                    # Imprimir en pantalla manteniendo el prompt de entrada
+                    print(f"\r[{formatted_time}] {sender}: {content}\n> ", end="")
+
+                elif msg_type == "ack":
+                    print(f"\r[SERVIDOR]: {packet.get('message')}\n> ", end="")
+
+                elif msg_type == "error":
+                    # Muestra mensajes de error (como el control de tasa / rate limit activado)
+                    print(f"\r[ALERTA SERVIDOR]: {packet.get('message')}\n> ", end="")
+
+            except json.JSONDecodeError:
+                print("\r[ERROR] Paquete corrupto o con formato no JSON.\n> ", end="")
+            except Exception as e:
+                if self.running:
+                    print(f"\r[ERROR DE RED] {e}\n> ", end="")
+                break
+
+    def start(self):
+        """Inicia el proceso de envío y escucha multihilo."""
+        self.register()
+
+        # Iniciar hilo en segundo plano para escuchar al servidor
+        listener_thread = threading.Thread(target=self.receive_messages, daemon=True)
+        listener_thread.start()
+
+        print("\n" + "=" * 60)
+        print(" CHAT UDP INICIADO - Escriba su mensaje y presione Enter ('salir' para finalizar)")
+        print("=" * 60)
+
+        try:
+            while self.running:
+                message = input("> ").strip()
+                if not message:
+                    continue
+                if message.lower() == 'salir':
+                    print("Saliendo de la aplicación...")
+                    break
+
+                # Firmar digitalmente el mensaje antes de enviarlo
+                signature = self.sign_message(message)
+                payload = {
+                    "type": "message",
+                    "content": message,
+                    "signature": signature
+                }
+
+                # Enviar datagrama UDP
+                self.sock.sendto(json.dumps(payload).encode('utf-8'), self.server_addr)
+
+        except KeyboardInterrupt:
+            print("\nCerrando aplicación...")
+        finally:
+            self.running = False
+            self.sock.close()
+
+
+if __name__ == "__main__":
+    client = UDPClient()
+    client.start()
